@@ -109,6 +109,8 @@ Build a RAG index from the bundled sample PDF:
 python3 -m app.cli rag-build
 ```
 
+When `--pdf` is omitted, `rag-build` recursively indexes the local PDF database from `sample_data/`, `outputs/downloaded_reports/`, `data/raw/`, and `esg_scraper/data/pdfs/`.
+
 Ask a question against the built index:
 
 ```bash
@@ -176,6 +178,8 @@ python3 -m app.cli rag-ask "TRIR 2024" --agentic
 python3 -m app.cli rag-ask "emissions targets" --filter-pillar environmental --filter-year 2024
 ```
 
+The default Q&A path uses hybrid semantic plus lexical retrieval, a wider candidate pool, and deterministic answer generation. Answers are instructed to rely only on retrieved document context, cite chunk IDs, include short evidence excerpts, and flag uncertainty when the retrieved context is incomplete.
+
 ### `ragas-eval`
 
 Run RAGAS evaluation metrics (faithfulness, answer relevancy, context precision/recall, hallucination detection):
@@ -184,6 +188,8 @@ Run RAGAS evaluation metrics (faithfulness, answer relevancy, context precision/
 python3 -m app.cli ragas-eval --company TotalEnergies
 python3 -m app.cli ragas-eval --company TotalEnergies --eval-mode all --query-transform hyde
 ```
+
+The RAGAS-style evaluator also reports retrieval hit, partial, and miss rates against the expected contexts in `sample_data/rag_evaluation_dataset.csv`, so answer quality and retrieval quality can be diagnosed separately.
 
 ### `mcp` — MCP Tool Architecture
 

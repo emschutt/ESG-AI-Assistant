@@ -44,7 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     rag_build.add_argument(
         "--pdf",
         action="append",
-        help="Path to a PDF to index. Repeat the flag to include multiple files.",
+        help=(
+            "Path to a PDF to index. Repeat the flag to include multiple files. "
+            "If omitted, the local database PDF directories are indexed recursively."
+        ),
     )
     rag_build.add_argument(
         "--index-dir",
@@ -122,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     rag_ask.add_argument(
         "--top-k",
         type=int,
-        default=5,
+        default=8,
         help="How many chunks to retrieve before answering.",
     )
     rag_ask.add_argument(
@@ -131,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rag_ask.add_argument(
         "--retrieval-mode",
-        default="dense",
+        default="hybrid",
         choices=["dense", "lexical", "hybrid"],
         help="Retrieval mode: dense (semantic embeddings), lexical (BM25-style), or hybrid (RRF fusion).",
     )
@@ -144,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     rag_ask.add_argument(
         "--candidate-k",
         type=int,
-        default=12,
+        default=100,
         help="How many candidate chunks to consider before the final top-k selection.",
     )
     rag_ask.add_argument(
@@ -160,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     rag_ask.add_argument(
         "--temperature",
         type=float,
-        default=0.5,
+        default=0.0,
         help="Temperature for the answer-generation model.",
     )
     rag_ask.add_argument(
@@ -198,6 +201,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--filter-pillar",
         choices=["environmental", "social", "governance", "all"],
         help="Filter retrieval to specific ESG pillar.",
+    )
+    rag_ask.add_argument(
+        "--filter-company",
+        help="Filter retrieval to a specific company (exact, case-insensitive).",
+    )
+    rag_ask.add_argument(
+        "--filter-speaker-role",
+        choices=["executive", "analyst", "management"],
+        help="Filter retrieval to earnings-call chunks with this speaker role.",
+    )
+    rag_ask.add_argument(
+        "--filter-chunk-kind",
+        choices=["narrative", "table_fact"],
+        help="Filter retrieval to narrative chunks or table-extracted facts.",
+    )
+    rag_ask.add_argument(
+        "--filter-doc-type",
+        help="Filter retrieval to a specific doc_type (e.g. urd, progress_report, earnings_call).",
     )
 
     rag_web = subparsers.add_parser("rag-web", help="Launch the local browser UI for ESG RAG")
@@ -239,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     rag_eval.add_argument(
         "--top-k",
         type=int,
-        default=5,
+        default=8,
         help="How many chunks to retrieve for each evaluation question.",
     )
     rag_eval.add_argument(
@@ -248,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rag_eval.add_argument(
         "--retrieval-mode",
-        default="dense",
+        default="hybrid",
         choices=["dense", "lexical", "hybrid"],
         help="Retrieval mode: dense (semantic embeddings), lexical (BM25-style), or hybrid (RRF fusion).",
     )
@@ -261,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     rag_eval.add_argument(
         "--candidate-k",
         type=int,
-        default=12,
+        default=100,
         help="How many candidate chunks to consider before the final top-k selection.",
     )
     rag_eval.add_argument(
@@ -489,19 +510,19 @@ def build_parser() -> argparse.ArgumentParser:
     ragas_eval.add_argument(
         "--top-k",
         type=int,
-        default=5,
+        default=8,
         help="How many chunks to retrieve per question.",
     )
     ragas_eval.add_argument(
         "--retrieval-mode",
-        default="dense",
+        default="hybrid",
         choices=["dense", "lexical", "hybrid"],
         help="Retrieval mode.",
     )
     ragas_eval.add_argument(
         "--candidate-k",
         type=int,
-        default=15,
+        default=100,
         help="Candidate retrieval breadth.",
     )
     ragas_eval.add_argument(

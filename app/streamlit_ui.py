@@ -14,6 +14,14 @@ from rapidfuzz import fuzz
 from app.llm import DEFAULT_ALBERT_BASE_URL, ChatModel, generate_completion, load_model_catalog
 from app.parsers.html_parser import parse_html
 from app.parsers.pdf_parser import parse_pdf
+from app.rag import (
+    DEFAULT_INDEX_DIR,
+    answer_question,
+    answer_question_cited,
+    get_index_summary,
+    retrieve_chunks,
+    set_api_key,
+)
 
 
 SUPPORTED_UPLOAD_SUFFIXES = {".pdf", ".html", ".htm", ".txt", ".md"}
@@ -295,6 +303,118 @@ def _inject_terminal_css() -> None:
     </style>""", unsafe_allow_html=True)
 
 
+def _run_corpus_mode(
+    *,
+    prompt: str,
+    api_key: str,
+    selected_model: ChatModel,
+    albert_base_url: str,
+    temperature: float,
+    index_dir: str,
+    top_k: int,
+    candidate_k: int,
+    retrieval_arch: str,
+    filter_year: str,
+    filter_pillar: str,
+    filter_company: str = "",
+    filter_speaker_role: str = "",
+    filter_chunk_kind: str = "",
+    filter_doc_type: str = "",
+) -> None:
+    """Corpus-RAG branch: retrieve from the local FAISS index, then answer."""
+    if not api_key:
+        st.error("Set the Albert API key in the sidebar first.")
+        return
+
+    index_path = Path(index_dir)
+    if not (index_path / "manifest.json").exists():
+        st.error(
+            f"No manifest at {index_path}. Build the index first with "
+            "`python scripts/build_index_from_embeddings.py`."
+        )
+        return
+
+    set_api_key(api_key)
+    fy = filter_year.strip() or None
+    fp = filter_pillar if filter_pillar and filter_pillar != "all" else None
+    fc = filter_company.strip() or None
+    fsr = filter_speaker_role.strip() or None
+    fck = filter_chunk_kind.strip() or None
+    fdt = filter_doc_type.strip() or None
+
+    with st.spinner(f"Retrieving from {index_path.name}…"):
+        try:
+            results, used_embed = retrieve_chunks(
+                index_dir=index_path,
+                question=prompt,
+                top_k=top_k,
+                retrieval_architecture=retrieval_arch,
+                search_breadth=candidate_k,
+                base_url=albert_base_url,
+                filter_year=fy,
+                filter_pillar=fp,
+                filter_company=fc,
+                filter_speaker_role=fsr,
+                filter_chunk_kind=fck,
+                filter_doc_type=fdt,
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.session_state["last_output"] = f"Error during retrieval: {exc}"
+            st.error(exc)
+            return
+
+    if not results:
+        active_filters = {
+            k: v for k, v in {
+                "filter_year": fy, "filter_pillar": fp, "filter_company": fc,
+                "filter_speaker_role": fsr, "filter_chunk_kind": fck,
+                "filter_doc_type": fdt,
+            }.items() if v
+        }
+        st.warning(
+            "No matching passages in the indexed corpus for this query"
+            + (f" ({active_filters})." if active_filters else ".")
+        )
+        st.session_state["last_output"] = ""
+        return
+
+    top_score = max(r["score"] for r in results)
+    if top_score < 0.3:
+        st.caption(
+            f"weak retrieval (top score={top_score:.3f}) — the answer may be unsupported by the corpus"
+        )
+
+    with st.spinner(f"Answering with {selected_model.label}…"):
+        try:
+            answer, used_text_model, citation_map, ordered_sources = answer_question_cited(
+                question=prompt,
+                retrieved_chunks=results,
+                text_model=selected_model.model_id,
+                temperature=temperature,
+                base_url=albert_base_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.session_state["last_output"] = f"Error during answer: {exc}"
+            st.error(exc)
+            return
+
+    st.session_state["last_output"] = answer
+    st.session_state["last_model"] = selected_model.label
+    st.session_state["last_prompt_with_context"] = (
+        f"[ESG corpus RAG] embed={used_embed} chat={used_text_model} "
+        f"index={index_path} top_k={top_k} arch={retrieval_arch} "
+        f"filter_year={fy!r} filter_pillar={fp!r} filter_company={fc!r} "
+        f"filter_speaker_role={fsr!r} filter_chunk_kind={fck!r} "
+        f"filter_doc_type={fdt!r}"
+    )
+    st.session_state["last_corpus_sources"] = ordered_sources
+    st.session_state["last_corpus_citation_map"] = citation_map
+    st.success(
+        f"Retrieved {len(results)} chunks (top score={top_score:.3f}) and answered "
+        f"with {selected_model.label}."
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="ESG AI Terminal", layout="wide")
     _inject_terminal_css()
@@ -311,6 +431,14 @@ def main() -> None:
     st.caption("> Ask questions against ESG reports using Albert models. Upload a document or use local sample_data.")
 
     with st.sidebar:
+        st.markdown("### > mode")
+        mode = st.radio(
+            "Mode",
+            ["ESG corpus (RAG)", "Single document"],
+            index=0,
+            label_visibility="collapsed",
+        )
+
         st.markdown("### > settings")
         api_key = st.text_input(
             "API Key",
@@ -350,6 +478,78 @@ def main() -> None:
             value=DEFAULT_SYSTEM_PROMPT,
             height=100,
         )
+
+        corpus_index_dir = str(DEFAULT_INDEX_DIR)
+        corpus_top_k = 8
+        corpus_candidate_k = 20
+        corpus_retrieval_arch = "dense"
+        corpus_filter_year = ""
+        corpus_filter_pillar = "all"
+        corpus_filter_company = ""
+        corpus_filter_speaker_role = ""
+        corpus_filter_chunk_kind = ""
+        corpus_filter_doc_type = ""
+        if mode == "ESG corpus (RAG)":
+            st.markdown("---")
+            st.markdown("### > corpus (RAG)")
+            corpus_index_dir = st.text_input("Index dir", value=str(DEFAULT_INDEX_DIR))
+            corpus_top_k = st.slider("top_k", min_value=1, max_value=30, value=8, step=1)
+            corpus_candidate_k = st.slider(
+                "Search breadth (candidate_k)",
+                min_value=corpus_top_k, max_value=100, value=max(20, corpus_top_k), step=1,
+            )
+            corpus_retrieval_arch = st.selectbox(
+                "Retrieval architecture",
+                ["dense", "hybrid", "semantic_rerank", "lexical"],
+                index=0,
+            )
+            corpus_filter_year = st.text_input(
+                "Filter year (optional)",
+                value="",
+                placeholder="e.g. 2024",
+                help="Substring match against source_file (which includes the year token).",
+            )
+            corpus_filter_pillar = st.selectbox(
+                "Filter pillar",
+                ["all", "environmental", "social", "governance"],
+                index=0,
+            )
+            corpus_filter_company = st.text_input(
+                "Filter company (optional)",
+                value="",
+                placeholder="e.g. TotalEnergies",
+                help="Exact, case-insensitive match against the chunk's company field.",
+            )
+            corpus_filter_speaker_role = st.selectbox(
+                "Filter speaker role",
+                ["", "executive", "analyst", "management"],
+                index=0,
+                help="Only set for earnings_call chunks — narrows to who was speaking.",
+            )
+            corpus_filter_chunk_kind = st.selectbox(
+                "Filter chunk kind",
+                ["", "narrative", "table_fact"],
+                index=0,
+            )
+            corpus_filter_doc_type = st.selectbox(
+                "Filter doc_type",
+                ["", "earnings_call", "urd", "progress_report", "sustainability_report",
+                 "integrated_report", "climate_report", "esg_databook", "vigilance_plan",
+                 "regulation"],
+                index=0,
+            )
+            summary = get_index_summary(Path(corpus_index_dir))
+            if summary:
+                st.caption(
+                    f"index loaded: {summary.get('chunk_count', '?')} chunks, "
+                    f"embedding_model={summary.get('embedding_model', '?')}, "
+                    f"backend={summary.get('vector_backend', '?')}"
+                )
+            else:
+                st.warning(
+                    f"No manifest at {corpus_index_dir}. "
+                    "Run `python scripts/build_index_from_embeddings.py` first."
+                )
 
         st.markdown("---")
         st.markdown("### > document")
@@ -420,6 +620,24 @@ def main() -> None:
             st.error("Select an Albert model first.")
         elif not prompt.strip():
             st.warning("Type a prompt before running.")
+        elif mode == "ESG corpus (RAG)":
+            _run_corpus_mode(
+                prompt=prompt.strip(),
+                api_key=api_key,
+                selected_model=selected_model,
+                albert_base_url=albert_base_url,
+                temperature=temperature,
+                index_dir=corpus_index_dir,
+                top_k=corpus_top_k,
+                candidate_k=corpus_candidate_k,
+                retrieval_arch=corpus_retrieval_arch,
+                filter_year=corpus_filter_year,
+                filter_pillar=corpus_filter_pillar,
+                filter_company=corpus_filter_company,
+                filter_speaker_role=corpus_filter_speaker_role,
+                filter_chunk_kind=corpus_filter_chunk_kind,
+                filter_doc_type=corpus_filter_doc_type,
+            )
         else:
             final_prompt = prompt.strip()
             selected_document = None
@@ -480,6 +698,27 @@ def main() -> None:
     if st.session_state.get("last_prompt_with_context"):
         with st.expander("Full prompt sent to model"):
             st.markdown(st.session_state.get("last_prompt_with_context", ""))
+
+    corpus_sources = st.session_state.get("last_corpus_sources")
+    citation_map = st.session_state.get("last_corpus_citation_map") or {}
+    if corpus_sources:
+        with st.expander(f"Sources / Citations ({len(corpus_sources)} chunks)"):
+            for idx, src in enumerate(corpus_sources, start=1):
+                # Trust the explicit citation_map if present; fall back to index.
+                cid = citation_map.get(idx) if isinstance(citation_map, dict) else None
+                cid = cid or src.get("chunk_id", "")
+                text = (src.get("text") or "")
+                if len(text) > 300:
+                    text = text[:300].rstrip() + "…"
+                st.markdown(
+                    f"**[{idx}]** `{cid}` · score `{src['score']:.4f}` · "
+                    f"pillar `{src.get('esg_pillar') or '—'}`  \n"
+                    f"`{src['source_file']}` · pages "
+                    f"{src['page_start']}-{src['page_end']}  \n"
+                    f"_{src.get('contextual_summary', '')}_"
+                )
+                st.markdown(f"> {text}")
+                st.markdown("---")
 
 
 if __name__ == "__main__":

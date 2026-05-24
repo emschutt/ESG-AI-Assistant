@@ -21,11 +21,48 @@ from app.utils import OUTPUT_DIR, ensure_directories, normalize_whitespace
 
 DEFAULT_BASE_URL = "https://albert.api.etalab.gouv.fr/v1"
 DEFAULT_INDEX_DIR = OUTPUT_DIR / "rag_index"
-DEFAULT_SAMPLE_DIR = Path(__file__).resolve().parent.parent / "sample_data"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_SAMPLE_DIR = REPO_ROOT / "sample_data"
 DEFAULT_SAMPLE_PDF = DEFAULT_SAMPLE_DIR / "totalenergies_sustainability-climate-2024-progress-report_2024_en_pdf.pdf"
+DEFAULT_DATABASE_PDF_DIRS = (
+    DEFAULT_SAMPLE_DIR,
+    OUTPUT_DIR / "downloaded_reports",
+    REPO_ROOT / "data" / "raw",
+    REPO_ROOT / "esg_scraper" / "data" / "pdfs",
+)
 TOKEN_PATTERN = re.compile(r"\S+")
 SEARCH_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 VALID_RETRIEVAL_ARCHITECTURES = ("semantic", "hybrid", "semantic_rerank", "dense", "lexical")
+SOURCE_FILENAME_STOPWORDS = {
+    "accessibleversion",
+    "annual",
+    "bd",
+    "climate",
+    "data",
+    "databook",
+    "document",
+    "downloaded",
+    "en",
+    "esg",
+    "integrated",
+    "pdf",
+    "pdfs",
+    "progress",
+    "raw",
+    "registration",
+    "report",
+    "reports",
+    "results",
+    "sustainability",
+    "tracker",
+    "universal",
+}
+SOURCE_IDENTIFIER_ALIASES = {
+    "herm_s": "hermes",
+    "l_or_al": "loreal oreal",
+    "l_oreal": "loreal oreal",
+    "nestl": "nestle",
+}
 
 
 def _normalize_retrieval_mode(mode: str) -> str:
@@ -68,6 +105,12 @@ class ChunkRecord:
     report_year: str = ""
     contains_table: bool = False
     contains_targets: bool = False
+    # Defaults keep `ChunkRecord(**item)` working on chunks.json built before
+    # these fields were populated; the converter fills them from metadata.jsonl.
+    company: str = ""
+    speaker_role: str = ""
+    chunk_kind: str = ""
+    doc_type: str = ""
 
 
 class AlbertClient:
@@ -385,11 +428,20 @@ def _tail_units_by_tokens(units: list[tuple[int, str, int]], overlap_tokens: int
         return []
 
     collected: list[tuple[int, str, int]] = []
-    running_total = 0
+    remaining_tokens = overlap_tokens
     for unit in reversed(units):
-        collected.append(unit)
-        running_total += unit[2]
-        if running_total >= overlap_tokens:
+        page_number, text, token_count = unit
+        if token_count <= remaining_tokens:
+            collected.append(unit)
+            remaining_tokens -= token_count
+        else:
+            words = TOKEN_PATTERN.findall(text)
+            tail_words = words[-remaining_tokens:] if remaining_tokens > 0 else []
+            if tail_words:
+                tail_text = " ".join(tail_words)
+                collected.append((page_number, tail_text, estimate_token_count(tail_text)))
+            break
+        if remaining_tokens <= 0:
             break
     return list(reversed(collected))
 
@@ -491,11 +543,24 @@ def gather_pdf_paths(pdf_paths: list[str] | None) -> list[Path]:
         resolved = [Path(path).expanduser().resolve() for path in pdf_paths]
         return resolved
 
+    discovered: list[Path] = []
+    seen: set[Path] = set()
+    for directory in DEFAULT_DATABASE_PDF_DIRS:
+        if not directory.exists():
+            continue
+        for path in sorted(directory.rglob("*.pdf")):
+            resolved = path.resolve()
+            if resolved not in seen:
+                discovered.append(resolved)
+                seen.add(resolved)
+
+    if discovered:
+        return discovered
+
     if DEFAULT_SAMPLE_PDF.exists():
         return [DEFAULT_SAMPLE_PDF.resolve()]
 
-    default_pdfs = sorted(DEFAULT_SAMPLE_DIR.glob("*.pdf"))
-    return [path.resolve() for path in default_pdfs]
+    return []
 
 
 def parse_pdf_path_lines(raw_value: str) -> list[Path]:
@@ -519,10 +584,16 @@ def build_chunk_records(
     overlap_tokens: int = 0,
     section_aware: bool = False,
     contextual_chunking: bool = False,
+    skipped_pdfs: list[dict[str, str]] | None = None,
 ) -> list[ChunkRecord]:
     chunk_records: list[ChunkRecord] = []
     for pdf_path in pdf_paths:
-        pages = extract_pdf_pages(pdf_path)
+        try:
+            pages = extract_pdf_pages(pdf_path)
+        except Exception as exc:
+            if skipped_pdfs is not None:
+                skipped_pdfs.append({"path": str(pdf_path), "reason": str(exc)})
+            continue
         chunk_records.extend(
             chunk_pages(
                 pages,
@@ -581,6 +652,48 @@ def search_vectors(query_vector: np.ndarray, vectors: np.ndarray, top_k: int) ->
 
 def _tokenize_for_search(text: str) -> list[str]:
     return SEARCH_TOKEN_PATTERN.findall(text.lower())
+
+
+def _tokens_for_source_identifier(source_file: str, source_path: str = "") -> set[str]:
+    source_parts = [Path(source_file).stem]
+    if source_path:
+        source = Path(source_path)
+        source_parts.extend(part for part in source.parts[-4:-1] if part)
+    raw_identifier = " ".join(source_parts).lower()
+    normalized_identifier = re.sub(r"[^a-z0-9]+", "_", raw_identifier)
+    alias_text = " ".join(
+        aliases
+        for slug, aliases in SOURCE_IDENTIFIER_ALIASES.items()
+        if slug in normalized_identifier
+    )
+    stem = f"{raw_identifier} {alias_text}".replace("_", " ").replace("-", " ")
+    tokens = set(_tokenize_for_search(stem))
+    return {
+        token
+        for token in tokens
+        if len(token) > 2
+        and token not in SOURCE_FILENAME_STOPWORDS
+        and not re.fullmatch(r"20\d{2}", token)
+    }
+
+
+def _infer_question_source_paths(question: str, chunks: list[ChunkRecord]) -> set[str]:
+    question_tokens = set(_tokenize_for_search(question))
+    if not question_tokens:
+        return set()
+
+    scores: dict[str, int] = {}
+    for chunk in chunks:
+        source_tokens = _tokens_for_source_identifier(chunk.source_file, chunk.source_path)
+        overlap = source_tokens & question_tokens
+        if overlap:
+            scores[chunk.source_path] = max(scores.get(chunk.source_path, 0), len(overlap))
+
+    if not scores:
+        return set()
+
+    best_score = max(scores.values())
+    return {source_path for source_path, score in scores.items() if score == best_score}
 
 
 def _normalize_match_scores(matches: list[tuple[int, float]]) -> dict[int, float]:
@@ -658,6 +771,7 @@ def select_chunk_matches(
     top_k: int,
     retrieval_architecture: str = "semantic",
     search_breadth: int | None = None,
+    candidate_indices: list[int] | None = None,
 ) -> list[tuple[int, float]]:
     architecture = _normalize_retrieval_mode(retrieval_architecture)
 
@@ -667,7 +781,10 @@ def select_chunk_matches(
         return semantic_matches[:top_k]
 
     if architecture == "lexical":
-        lexical_matches = _rank_score_map(_score_lexical_matches(question, chunks), breadth)
+        lexical_matches = _rank_score_map(
+            _score_lexical_matches(question, chunks, candidate_indices=candidate_indices),
+            breadth,
+        )
         return lexical_matches[:top_k]
 
     if architecture == "semantic_rerank":
@@ -687,7 +804,10 @@ def select_chunk_matches(
         ]
         return sorted(reranked, key=lambda item: item[1], reverse=True)[:top_k]
 
-    lexical_matches = _rank_score_map(_score_lexical_matches(question, chunks), breadth)
+    lexical_matches = _rank_score_map(
+        _score_lexical_matches(question, chunks, candidate_indices=candidate_indices),
+        breadth,
+    )
     fused_scores: Counter[int] = Counter()
     for ranking in (semantic_matches, lexical_matches):
         for rank, (index, _score) in enumerate(ranking, start=1):
@@ -747,6 +867,7 @@ def build_index(
     ensure_directories()
     index_dir.mkdir(parents=True, exist_ok=True)
 
+    skipped_pdfs: list[dict[str, str]] = []
     chunks = build_chunk_records(
         pdf_paths,
         target_tokens=target_tokens,
@@ -755,6 +876,7 @@ def build_index(
         overlap_tokens=overlap_tokens,
         section_aware=section_aware,
         contextual_chunking=contextual_chunking,
+        skipped_pdfs=skipped_pdfs,
     )
     if not chunks:
         raise RuntimeError("No extractable text was found in the provided PDFs.")
@@ -767,6 +889,7 @@ def build_index(
     manifest: dict[str, Any] = {
         "built_at": datetime.now(UTC).isoformat(),
         "pdfs": [str(path) for path in pdf_paths],
+        "skipped_pdfs": skipped_pdfs,
         "chunk_count": len(chunks),
         "target_tokens": target_tokens,
         "min_tokens": min_tokens,
@@ -820,6 +943,10 @@ def _filter_chunks(
     filter_year: str | None = None,
     filter_pillar: str | None = None,
     filter_report_type: str | None = None,
+    filter_company: str | None = None,
+    filter_speaker_role: str | None = None,
+    filter_chunk_kind: str | None = None,
+    filter_doc_type: str | None = None,
 ) -> list[dict[str, Any]]:
     filtered = chunks
     if filter_year:
@@ -832,7 +959,86 @@ def _filter_chunks(
         }
         keywords = pillar_keywords.get(filter_pillar, [])
         filtered = [c for c in filtered if any(kw in c["text"].lower() for kw in keywords)]
+
+    def _ci_equal(field_value: Any, requested: str) -> bool:
+        if field_value is None:
+            return False
+        return str(field_value).strip().lower() == requested.strip().lower()
+
+    if filter_company:
+        filtered = [c for c in filtered if _ci_equal(c.get("company"), filter_company)]
+    if filter_speaker_role:
+        filtered = [c for c in filtered if _ci_equal(c.get("speaker_role"), filter_speaker_role)]
+    if filter_chunk_kind:
+        filtered = [c for c in filtered if _ci_equal(c.get("chunk_kind"), filter_chunk_kind)]
+    if filter_doc_type:
+        filtered = [c for c in filtered if _ci_equal(c.get("doc_type"), filter_doc_type)]
     return filtered
+
+
+def _chunk_matches_filters(
+    chunk: ChunkRecord,
+    *,
+    allowed_source_paths: set[str] | None = None,
+    filter_year: str | None = None,
+    filter_pillar: str | None = None,
+    filter_report_type: str | None = None,
+    filter_company: str | None = None,
+    filter_speaker_role: str | None = None,
+    filter_chunk_kind: str | None = None,
+    filter_doc_type: str | None = None,
+) -> bool:
+    if allowed_source_paths and chunk.source_path not in allowed_source_paths:
+        return False
+
+    if filter_year and filter_year not in chunk.source_file and filter_year != chunk.report_year:
+        return False
+
+    if filter_pillar and filter_pillar != "all":
+        pillar = chunk.esg_pillar
+        if not pillar:
+            pillar = _detect_esg_pillar(chunk.text)
+        if pillar != filter_pillar:
+            return False
+
+    # Reserved for future report-type metadata. Keep the argument accepted so
+    # callers can pass it without losing compatibility.
+    if filter_report_type:
+        if filter_report_type.lower() not in chunk.source_file.lower():
+            return False
+
+    # Fine-grained exact-match filters (case-insensitive) on the four metadata
+    # fields populated by the converter from metadata.jsonl.
+    def _ci_equal(field_value: Any, requested: str) -> bool:
+        if field_value is None:
+            return False
+        return str(field_value).strip().lower() == requested.strip().lower()
+
+    if filter_company and not _ci_equal(chunk.company, filter_company):
+        return False
+    if filter_speaker_role and not _ci_equal(chunk.speaker_role, filter_speaker_role):
+        return False
+    if filter_chunk_kind and not _ci_equal(chunk.chunk_kind, filter_chunk_kind):
+        return False
+    if filter_doc_type and not _ci_equal(chunk.doc_type, filter_doc_type):
+        return False
+
+    return True
+
+
+def _search_vectors_for_indices(
+    query_vector: np.ndarray,
+    vectors: np.ndarray,
+    indices: list[int],
+    top_k: int,
+) -> list[tuple[int, float]]:
+    if not indices or vectors.ndim != 2 or vectors.size == 0:
+        return []
+    normalized_query = _normalize_embeddings(query_vector.reshape(1, -1))[0]
+    normalized_vectors = _normalize_embeddings(vectors[indices])
+    scores = normalized_vectors @ normalized_query
+    order = np.argsort(scores)[::-1][:top_k]
+    return [(indices[int(position)], float(scores[int(position)])) for position in order]
 
 
 def retrieve_chunks(
@@ -847,6 +1053,10 @@ def retrieve_chunks(
     filter_year: str | None = None,
     filter_pillar: str | None = None,
     filter_report_type: str | None = None,
+    filter_company: str | None = None,
+    filter_speaker_role: str | None = None,
+    filter_chunk_kind: str | None = None,
+    filter_doc_type: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     manifest = json.loads((index_dir / "manifest.json").read_text(encoding="utf-8"))
     vector_backend = manifest.get("vector_backend", "none")
@@ -854,6 +1064,25 @@ def retrieve_chunks(
         raise RuntimeError("This index was built with --dry-run and has no embeddings to search.")
 
     chunks = _load_chunks(index_dir)
+    allowed_source_paths = _infer_question_source_paths(question, chunks)
+    allowed_indices = [
+        index
+        for index, chunk in enumerate(chunks)
+        if _chunk_matches_filters(
+            chunk,
+            allowed_source_paths=allowed_source_paths,
+            filter_year=filter_year,
+            filter_pillar=filter_pillar,
+            filter_report_type=filter_report_type,
+            filter_company=filter_company,
+            filter_speaker_role=filter_speaker_role,
+            filter_chunk_kind=filter_chunk_kind,
+            filter_doc_type=filter_doc_type,
+        )
+    ]
+    if not allowed_indices:
+        return [], embedding_model or str(manifest.get("embedding_model", ""))
+
     client = AlbertClient(api_key=require_api_key(), base_url=base_url)
     selected_embedding_model = embedding_model or manifest.get("embedding_model")
     if not selected_embedding_model:
@@ -867,8 +1096,18 @@ def retrieve_chunks(
     )[0]
     breadth = max(top_k, search_breadth or top_k)
     normalized_mode = _normalize_retrieval_mode(retrieval_architecture)
+    filters_active = bool(
+        allowed_source_paths
+        or filter_year
+        or filter_pillar
+        or filter_report_type
+        or filter_company
+        or filter_speaker_role
+        or filter_chunk_kind
+        or filter_doc_type
+    )
 
-    if normalized_mode == "semantic" and vector_backend == "faiss" and faiss is not None:
+    if normalized_mode == "semantic" and vector_backend == "faiss" and faiss is not None and not filters_active:
         store = _load_vector_backend(index_dir, vector_backend)
         if hasattr(store, "search"):
             scores, indices = store.search(query_vector.reshape(1, -1), breadth)
@@ -878,7 +1117,7 @@ def retrieve_chunks(
             matches = search_vectors(query_vector, vectors, breadth)
     else:
         vectors = np.load(index_dir / "vectors.npy")
-        semantic_matches = search_vectors(query_vector, vectors, breadth)
+        semantic_matches = _search_vectors_for_indices(query_vector, vectors, allowed_indices, breadth)
         matches = select_chunk_matches(
             question=question,
             chunks=chunks,
@@ -886,6 +1125,7 @@ def retrieve_chunks(
             top_k=top_k,
             retrieval_architecture=retrieval_architecture,
             search_breadth=breadth,
+            candidate_indices=allowed_indices,
         )
 
     results: list[dict[str, Any]] = []
@@ -907,11 +1147,12 @@ def retrieve_chunks(
                 "report_year": chunk.report_year,
                 "contains_table": chunk.contains_table,
                 "contains_targets": chunk.contains_targets,
+                "company": chunk.company,
+                "speaker_role": chunk.speaker_role,
+                "chunk_kind": chunk.chunk_kind,
+                "doc_type": chunk.doc_type,
             }
         )
-
-    if filter_year or filter_pillar:
-        results = _filter_chunks(results, filter_year=filter_year, filter_pillar=filter_pillar, filter_report_type=filter_report_type)
 
     return results, selected_embedding_model
 
@@ -1046,23 +1287,30 @@ def answer_question(
         )
 
     system_prompt = (
-        "You are an ESG analyst. Your task is to answer questions using only the supplied context. "
-        "Follow these rules strictly:\n"
-        "1. Answer ONLY from the supplied context. Do not use outside knowledge.\n"
-        "2. Clearly separate disclosed facts from your own interpretation. Precede interpretations with "
-        "'Based on the disclosed information,' or similar phrasing.\n"
-        "3. Cite supporting chunk IDs in brackets for every factual claim, e.g. [chunk-0003].\n"
-        "4. If the context is insufficient to answer the question, state that clearly: "
+        "You are an ESG analyst producing reliable, reproducible answers from a document database. "
+        "Use only the supplied context; never use outside knowledge or infer missing figures.\n"
+        "\n"
+        "Required output format. Use these exact Markdown section headings, in this order:\n"
+        "**Key takeaway**\n"
+        "- Give the direct answer in 1-3 short sentences. If the answer is not evidenced, write: "
         "'The provided context does not contain sufficient evidence to answer this question.'\n"
-        "5. When extracting targets, include these details when available:\n"
-        "   - metric (e.g., CO2e emissions, TRIR)\n"
-        "   - baseline value and year\n"
-        "   - target value and target year\n"
-        "   - scope (Scope 1, 2, 3) if applicable\n"
-        "   - coverage (e.g., global operations, specific region)\n"
-        "   - methodology (e.g., SBTi-validated, location-based)\n"
-        "6. Do not make unsupported claims or fabricate data.\n"
-        "7. Be concise but thorough. Prefer numbered lists for multi-part answers."
+        "\n"
+        "**Detailed answer**\n"
+        "- Explain the answer with enough detail for an ESG analyst to audit it.\n"
+        "- Cite supporting chunk IDs in brackets for every factual claim, e.g. [chunk-0003]. "
+        "Copy chunk IDs exactly with the ASCII hyphen character.\n"
+        "- When extracting ESG targets or metrics, include metric, value, year, baseline, scope, coverage, "
+        "and methodology only when those fields are explicitly present.\n"
+        "\n"
+        "**Evidence excerpts**\n"
+        "- Include 2-5 verbatim snippets copied from the context. Each excerpt must be under 35 words "
+        "and followed by its chunk ID.\n"
+        "\n"
+        "**Uncertainty**\n"
+        "- State what is unknown, partial, conflicting, low-scoring, or absent. Do not guess.\n"
+        "\n"
+        "Keep the tone professional and concise. Avoid unsupported interpretation. If interpretation is "
+        "necessary, label it with 'Based on the disclosed information'."
     )
 
     messages = [
@@ -1073,6 +1321,115 @@ def answer_question(
         },
     ]
     return client.chat_completion(selected_text_model, messages, temperature=temperature), selected_text_model
+
+
+def answer_question_cited(
+    *,
+    question: str,
+    retrieved_chunks: list[dict[str, Any]],
+    text_model: str | None = None,
+    temperature: float | None = None,
+    base_url: str = DEFAULT_BASE_URL,
+) -> tuple[str, str, dict[int, str], list[dict[str, Any]]]:
+    """Variant of `answer_question` that uses numbered citations `[1]`, `[2]`...
+
+    Returns (answer_text, model_id, citation_map, ordered_sources) where
+    `citation_map` is `{1: chunk_id, 2: chunk_id, ...}` and `ordered_sources`
+    is the deduplicated list of chunk dicts in the same order. This kills the
+    `[chunk-NNNN]` / `[tXXXX]` suffix-latching that happens when the model
+    sees long chunk_ids and the system-prompt example `[chunk-0003]`.
+
+    The other callers of `answer_question` are left on the original 2-tuple
+    signature; only the corpus-RAG CLI / Streamlit paths use this.
+    """
+    if not retrieved_chunks:
+        raise RuntimeError("No retrieved chunks were provided to the answer stage.")
+
+    client = AlbertClient(api_key=require_api_key(), base_url=base_url)
+    selected_text_model = text_model or client.get_text_generation_model()
+
+    seen_texts: set[str] = set()
+    ordered_sources: list[dict[str, Any]] = []
+    context_blocks: list[str] = []
+    citation_map: dict[int, str] = {}
+
+    for chunk in retrieved_chunks:
+        normalized = normalize_whitespace(chunk["text"])
+        if normalized in seen_texts:
+            continue
+        seen_texts.add(normalized)
+        n = len(ordered_sources) + 1
+        ordered_sources.append(chunk)
+        citation_map[n] = chunk["chunk_id"]
+        company = chunk.get("company") or ""
+        doc_type = chunk.get("doc_type") or chunk.get("section_title") or ""
+        report_year = chunk.get("report_year") or ""
+        header = (
+            f"[{n}] {company} · {doc_type} · FY{report_year} · "
+            f"{chunk['source_file']} pages {chunk['page_start']}-{chunk['page_end']}"
+        )
+        context_blocks.append(f"{header}\n{chunk['text']}")
+    context = "\n\n".join(context_blocks)
+
+    top_score = max(chunk["score"] for chunk in retrieved_chunks) if retrieved_chunks else 0.0
+    weak_retrieval_note = ""
+    if top_score < 0.3:
+        weak_retrieval_note = (
+            "Note: the top retrieval score is low, indicating the context may not "
+            "contain sufficient evidence. If you cannot find a clear answer, say so explicitly.\n"
+        )
+
+    # Same structured-output contract as upstream's answer_question, but with
+    # NUMBERED citations [1]/[2]/[3] instead of [chunk-NNNN] (which the model
+    # would otherwise truncate to e.g. [chunk-0079] or [t1456] when chunk_ids
+    # are long).
+    system_prompt = (
+        "You are an ESG analyst producing reliable, reproducible answers from a document database. "
+        "Use only the supplied context; never use outside knowledge or infer missing figures.\n"
+        "\n"
+        "Required output format. Use these exact Markdown section headings, in this order:\n"
+        "**Key takeaway**\n"
+        "- Give the direct answer in 1-3 short sentences. If the answer is not evidenced, write: "
+        "'The provided context does not contain sufficient evidence to answer this question.'\n"
+        "\n"
+        "**Detailed answer**\n"
+        "- Explain the answer with enough detail for an ESG analyst to audit it.\n"
+        "- Cite supporting passages by their bracketed NUMBER, e.g. [1] or [2], [3]. "
+        "Use ONLY the numbers shown in the context headers — do not invent labels.\n"
+        "- When extracting ESG targets or metrics, include metric, value, year, baseline, scope, coverage, "
+        "and methodology only when those fields are explicitly present.\n"
+        "\n"
+        "**Evidence excerpts**\n"
+        "- Include 2-5 verbatim snippets copied from the context. Each excerpt must be under 35 words "
+        "and followed by its bracketed number.\n"
+        "\n"
+        "**Uncertainty**\n"
+        "- State what is unknown, partial, conflicting, low-scoring, or absent. Do not guess.\n"
+        "\n"
+        "**Attribution rules (apply across every section)**\n"
+        "- Attribute each statement to the speaker named in the passage it comes from. "
+        "Earnings-call passages name the speaker inline (for example, "
+        "'Name [Executives]:'); use that name.\n"
+        "- Do NOT assign a role or title (CEO, CFO, COO, Chair, etc.) to any person "
+        "unless that exact title is written in the context. If the speaker has no "
+        "stated title, refer to them by name, or as 'a company executive' — never "
+        "guess or infer a title.\n"
+        "- Do not combine statements from different speakers under a single person's "
+        "name or title. If several executives spoke, attribute each point to its own speaker.\n"
+        "\n"
+        "Keep the tone professional and concise. Avoid unsupported interpretation. If interpretation is "
+        "necessary, label it with 'Based on the disclosed information'."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"Question: {question}\n\n{weak_retrieval_note}Context:\n{context}",
+        },
+    ]
+    answer = client.chat_completion(selected_text_model, messages, temperature=temperature)
+    return answer, selected_text_model, citation_map, ordered_sources
 
 
 def run_rag_build(args: Any) -> int:
@@ -1108,6 +1465,10 @@ def run_rag_ask(args: Any) -> int:
     agentic = getattr(args, "agentic", False)
     filter_year = getattr(args, "filter_year", None)
     filter_pillar = getattr(args, "filter_pillar", None)
+    filter_company = getattr(args, "filter_company", None)
+    filter_speaker_role = getattr(args, "filter_speaker_role", None)
+    filter_chunk_kind = getattr(args, "filter_chunk_kind", None)
+    filter_doc_type = getattr(args, "filter_doc_type", None)
     candidate_k = getattr(args, "candidate_k", None) or args.search_breadth or 12
 
     question = " ".join(args.question).strip()
@@ -1155,6 +1516,10 @@ def run_rag_ask(args: Any) -> int:
             base_url=args.base_url,
             filter_year=filter_year,
             filter_pillar=filter_pillar,
+            filter_company=filter_company,
+            filter_speaker_role=filter_speaker_role,
+            filter_chunk_kind=filter_chunk_kind,
+            filter_doc_type=filter_doc_type,
         )
         print(
             f"Retrieved {len(retrieved)} chunks using {embedding_model} "
@@ -1176,7 +1541,11 @@ def run_rag_ask(args: Any) -> int:
     if args.search_only:
         return 0
 
-    answer, text_model = answer_question(
+    if not retrieved:
+        print("\n(no chunks retrieved — refusing to call the answer stage)")
+        return 0
+
+    answer, text_model, citation_map, ordered_sources = answer_question_cited(
         question=question,
         retrieved_chunks=retrieved,
         text_model=args.text_model,
@@ -1184,4 +1553,14 @@ def run_rag_ask(args: Any) -> int:
         base_url=args.base_url,
     )
     print(f"\nAnswer ({text_model}):\n{answer}")
+    print("\nCitations:")
+    for n, cid in sorted(citation_map.items()):
+        src = ordered_sources[n - 1]
+        print(
+            f"  [{n}] {cid}  "
+            f"({src.get('company') or '?'} · {src.get('doc_type') or src.get('section_title') or '?'} · "
+            f"FY{src.get('report_year') or '?'}, "
+            f"{src.get('source_file', '?')} pages {src.get('page_start', '?')}-{src.get('page_end', '?')}, "
+            f"score={src.get('score', 0):.4f})"
+        )
     return 0

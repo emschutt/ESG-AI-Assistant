@@ -10,16 +10,23 @@ from __future__ import annotations
 
 import json
 import re
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from app.rag import AlbertClient, DEFAULT_BASE_URL, answer_question, require_api_key, retrieve_chunks
+from app.rag import (
+    AlbertClient,
+    DEFAULT_BASE_URL,
+    answer_question,
+    require_api_key,
+    retrieve_chunks,
+    retrieve_with_transform,
+)
 from app.rag_eval import (
     DEFAULT_EVAL_DATASET,
     _infer_company,
     _load_rows,
     _parse_expected_contexts,
+    _score_retrieval,
     compute_eval_summary,
 )
 from app.utils import OUTPUT_DIR
@@ -30,6 +37,37 @@ DEFAULT_RAGAS_OUTPUT = OUTPUT_DIR / "ragas_eval_results.json"
 def _call_judge(client: AlbertClient, model: str, prompt: str, temperature: float = 0.0) -> str:
     messages = [{"role": "user", "content": prompt}]
     return client.chat_completion(model, messages, temperature=temperature)
+
+
+def _parse_json_object(raw: str) -> dict[str, Any]:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        parsed = json.loads(raw[start : end + 1])
+
+    if not isinstance(parsed, dict):
+        raise json.JSONDecodeError("Expected a JSON object", raw, 0)
+    return parsed
+
+
+def extract_cited_chunk_ids(answer: str) -> set[str]:
+    normalized = (
+        answer.replace("\u2011", "-")
+        .replace("\u2010", "-")
+        .replace("\u2012", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+    )
+    return set(re.findall(r"[\[【]\s*(chunk-\d+)\s*[\]】]", normalized))
 
 
 def score_faithfulness(question: str, answer: str, context_chunks: list[dict[str, Any]], client: AlbertClient, model: str) -> dict[str, Any]:
@@ -61,7 +99,7 @@ Only output valid JSON. No markdown."""
 
     try:
         raw = _call_judge(client, model, prompt)
-        parsed = json.loads(raw)
+        parsed = _parse_json_object(raw)
         verdicts = parsed.get("verdicts", [])
         supported = sum(1 for v in verdicts if v.get("verdict") == "supported")
         total = len(verdicts)
@@ -95,7 +133,7 @@ Only output valid JSON. No markdown."""
 
     try:
         raw = _call_judge(client, model, prompt)
-        parsed = json.loads(raw)
+        parsed = _parse_json_object(raw)
         return {"score": float(parsed.get("score", 0.0)), "reasoning": parsed.get("reasoning", ""), "raw": raw}
     except (json.JSONDecodeError, Exception) as exc:
         return {"score": 0.0, "reasoning": f"Judge evaluation failed: {exc}", "raw": None}
@@ -133,7 +171,7 @@ Only output valid JSON. No markdown."""
 
     try:
         raw = _call_judge(client, model, prompt)
-        parsed = json.loads(raw)
+        parsed = _parse_json_object(raw)
         verdicts = parsed.get("verdicts", [])
         relevant = sum(1 for v in verdicts if v.get("verdict") in ("highly_relevant", "somewhat_relevant"))
         highly = sum(1 for v in verdicts if v.get("verdict") == "highly_relevant")
@@ -177,7 +215,7 @@ Only output valid JSON. No markdown."""
 
     try:
         raw = _call_judge(client, model, prompt)
-        parsed = json.loads(raw)
+        parsed = _parse_json_object(raw)
         verdicts = parsed.get("verdicts", [])
         covered = sum(1 for v in verdicts if v.get("verdict") in ("covered", "partially_covered"))
         fully = sum(1 for v in verdicts if v.get("verdict") == "covered")
@@ -218,7 +256,7 @@ If no hallucinations are found, set hallucination_free to true. Only output vali
 
     try:
         raw = _call_judge(client, model, prompt)
-        parsed = json.loads(raw)
+        parsed = _parse_json_object(raw)
         claims = parsed.get("hallucinated_claims", [])
         is_free = parsed.get("hallucination_free", len(claims) == 0)
         score = 1.0 if is_free else max(0.0, 1.0 - (len(claims) * 0.25))
@@ -275,7 +313,7 @@ Only output valid JSON. No markdown."""
 
     try:
         raw = _call_judge(client, model, prompt)
-        parsed = json.loads(raw)
+        parsed = _parse_json_object(raw)
         unsupported = parsed.get("unsupported", [])
         total = parsed.get("supported_count", 0) + len(unsupported)
         score = round(1.0 - (len(unsupported) / max(total, 1)), 4)
@@ -309,19 +347,41 @@ def run_full_ragas_eval(
         raise RuntimeError(f"No evaluation rows found for company '{selected_company}'.")
 
     results: list[dict[str, Any]] = []
-    for row_index, row in enumerate(company_rows):
+    retrieval_results: list[dict[str, Any]] = []
+    for row in company_rows:
         question = row["question"]
         ground_truth = row.get("ground_truth", "")
         expected_contexts = _parse_expected_contexts(row)
 
-        retrieved_chunks, _ = retrieve_chunks(
-            index_dir=index_dir,
-            question=question,
-            top_k=top_k,
-            retrieval_architecture=retrieval_mode,
-            search_breadth=candidate_k,
-            base_url=base_url,
-        )
+        diagnostics: list[dict[str, Any]] = []
+        if query_transform and query_transform != "none":
+            retrieved_chunks, _embedding_model, diagnostics = retrieve_with_transform(
+                index_dir=index_dir,
+                question=question,
+                top_k=top_k,
+                retrieval_mode=retrieval_mode,
+                candidate_k=candidate_k,
+                query_transform=query_transform,
+                base_url=base_url,
+            )
+        else:
+            retrieved_chunks, _embedding_model = retrieve_chunks(
+                index_dir=index_dir,
+                question=question,
+                top_k=top_k,
+                retrieval_architecture=retrieval_mode,
+                search_breadth=candidate_k,
+                base_url=base_url,
+            )
+
+        retrieval_scoring = _score_retrieval(expected_contexts, retrieved_chunks)
+        retrieval_row = {
+            "status": retrieval_scoring["status"],
+            "best_match_score": retrieval_scoring["best_match_score"],
+            "best_chunk_id": retrieval_scoring["best_chunk_id"],
+            "top_score": retrieved_chunks[0]["score"] if retrieved_chunks else None,
+        }
+        retrieval_results.append(retrieval_row)
 
         answer = ""
         if eval_mode in ("answer", "ragas", "all"):
@@ -329,6 +389,7 @@ def run_full_ragas_eval(
                 question=question,
                 retrieved_chunks=retrieved_chunks,
                 text_model=text_model,
+                temperature=0.0,
                 base_url=base_url,
             )
 
@@ -339,16 +400,16 @@ def run_full_ragas_eval(
             "ground_truth": ground_truth,
             "answer": answer,
             "retrieved_count": len(retrieved_chunks),
+            "retrieved_chunk_ids": [chunk["chunk_id"] for chunk in retrieved_chunks],
+            "retrieval_diagnostics": diagnostics,
         }
 
         cited_chunk_ids: set[str] = set()
         if answer:
-            cited_chunk_ids = set(re.findall(r"\[(chunk-\d+)\]", answer))
+            cited_chunk_ids = extract_cited_chunk_ids(answer)
 
         if eval_mode in ("retrieval", "ragas", "all"):
-            result_entry["retrieval"] = compute_eval_summary(
-                [{"status": "hit", "best_match_score": 100.0, "top_score": retrieved_chunks[0]["score"] if retrieved_chunks else 0.0}]
-            )
+            result_entry["retrieval"] = retrieval_row
 
         if eval_mode in ("ragas", "all") and answer:
             faithfulness = score_faithfulness(question, answer, retrieved_chunks, client, text_model)
@@ -385,7 +446,14 @@ def run_full_ragas_eval(
         "question_count": len(results),
         "eval_mode": eval_mode,
         "text_model": text_model,
+        "retrieval_mode": retrieval_mode,
+        "candidate_k": candidate_k,
+        "top_k": top_k,
+        "query_transform": query_transform or "none",
     }
+
+    if eval_mode in ("retrieval", "ragas", "all"):
+        aggregated["retrieval_summary"] = compute_eval_summary(retrieval_results)
 
     if eval_mode in ("ragas", "all") and results:
         ragas_keys = [
@@ -421,6 +489,14 @@ def run_ragas_eval(args: Any) -> int:
 
     print(f"RAGAS evaluation complete for {payload['company']} ({payload['question_count']} questions)")
     print(f"Eval mode: {payload['eval_mode']} | Model: {payload['text_model']}")
+
+    if "retrieval_summary" in payload:
+        r = payload["retrieval_summary"]
+        print(
+            f"Retrieval hit rate: {r['hit_rate']:.1%} | "
+            f"Partial+hit: {r['partial_or_hit_rate']:.1%} | "
+            f"Avg match: {r['average_best_match_score']:.2f}"
+        )
 
     if "ragas_summary" in payload:
         s = payload["ragas_summary"]
