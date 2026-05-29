@@ -1,0 +1,20 @@
+{
+  "built_at": "2026-05-29T20:07:32.041081+00:00",
+  "pdfs": [
+    "C:\\Users\\Utilisateur\\Desktop\\AMIN_FILES\\MASTER FTD\\S2\\ESG RAG\\ESG-AI-Assistant_opti\\eval\\pdfs\\2024_esg_databook_7c8b17a4.pdf",
+    "C:\\Users\\Utilisateur\\Desktop\\AMIN_FILES\\MASTER FTD\\S2\\ESG RAG\\ESG-AI-Assistant_opti\\eval\\pdfs\\2025_esg_databook_f3e687d8.pdf",
+    "C:\\Users\\Utilisateur\\Desktop\\AMIN_FILES\\MASTER FTD\\S2\\ESG RAG\\ESG-AI-Assistant_opti\\eval\\pdfs\\2025_esg_tracker_12b5e339.pdf",
+    "C:\\Users\\Utilisateur\\Desktop\\AMIN_FILES\\MASTER FTD\\S2\\ESG RAG\\ESG-AI-Assistant_opti\\eval\\pdfs\\2026_thematic_report_c9fe4c07.pdf"
+  ],
+  "skipped_pdfs": [],
+  "chunk_count": 61,
+  "target_tokens": 380,
+  "min_tokens": 274,
+  "max_tokens": 464,
+  "overlap_tokens": 60,
+  "section_aware": false,
+  "contextual_chunking": false,
+  "vector_backend": "faiss",
+  "embedding_model": "BAAI/bge-m3",
+  "embedding_dimension": 1024
+}
